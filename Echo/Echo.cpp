@@ -1,3 +1,4 @@
+#define _SILENCE_CXX23_DENORM_DEPRECATION_WARNING
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -5,6 +6,7 @@
 #include <stdexcept>
 #include <sndfile.h>
 #include <string>
+#include <Eigen/Dense>
 
 // ========== Matrix IO ==========
 std::vector<std::vector<double>> loadMatrix(const std::string& filename) {
@@ -55,21 +57,41 @@ public:
 private:
     std::vector<std::vector<double>> W;
     std::vector<double> state;
-	double alpha = 0.1; // Leaky integrator coefficient
+	double alpha = 1.0; // Leaky integrator coefficient
  };
 
 // ========== Readout ==========
 class Readout {
 public:
-    Readout(const Reservoir* res) : reservoir(res) {
-        // Randomize weights for readout
+    // --- Constructor for live/realtime mode ---
+    Readout(const Reservoir* res)
+        : reservoir(res)
+    {
+        if (!reservoir) {
+            throw std::runtime_error("Reservoir pointer is null in live Readout");
+        }
+
+        // Initialize random weights
         std::mt19937 rng(std::random_device{}());
         std::uniform_real_distribution<double> dist(-1.0, 1.0);
+
         weights.resize(reservoir->size());
         for (auto& w : weights) w = dist(rng);
     }
 
-    double process() const {
+    // --- Constructor for offline (trained) mode ---
+    Readout(std::vector<double> trainedWeights)
+        : reservoir(nullptr), weights(std::move(trainedWeights))
+    {
+        // no reservoir needed in offline processing
+    }
+
+    // --- Live processing ---
+    double processSample() const {
+        if (!reservoir) {
+            throw std::runtime_error("processSample called in offline mode");
+        }
+
         double sum = 0.0;
         const auto& st = reservoir->getState();
         for (size_t i = 0; i < st.size(); i++) {
@@ -78,22 +100,33 @@ public:
         return sum;
     }
 
+    // --- Offline processing ---
+    std::vector<double> processEcho(const Eigen::MatrixXd& Echo) const {
+        std::vector<double> output(Echo.rows());
+        for (int t = 0; t < Echo.rows(); t++) {
+            output[t] = 0.0;
+            for (int j = 0; j < Echo.cols(); j++) {
+                output[t] += weights[j] * Echo(t, j);
+            }
+        }
+        return output;
+    }
+
 private:
-    const Reservoir* reservoir;
-    std::vector<double> weights;
+    const Reservoir* reservoir;   // only valid in live mode
+    std::vector<double> weights;  // trained or random init
 };
+
 
 // ========== Main ==========
 int main() {
+    std::cout << "Loading Data\n";
+
     // 1. Load reservoir weight matrix
     auto W = loadMatrix("reservoir.bin");
 
     // 2. Initialize reservoir
     Reservoir reservoir(W);
-
-    // 3. Two randomized readouts
-    Readout readoutL(&reservoir);
-    Readout readoutR(&reservoir);
 
     // 4. Load mono WAV
     SF_INFO sfinfo;
@@ -110,22 +143,45 @@ int main() {
     sf_readf_double(infile, input.data(), sfinfo.frames);
     sf_close(infile);
 
-    // 5. Prepare stereo output
-    std::vector<double> output(sfinfo.frames * 2);
+	int T = sfinfo.frames; // Number of time steps
+	int N = reservoir.size(); // Number of reservoir neurons
+    // X: matrix of states (T x N)
+    // y: target vector (T x 1)
+    Eigen::MatrixXd Echo(T, N);
+    Eigen::VectorXd Target(T);
 
+    // 5. Prepare stereo output
+    std::vector<double> output(sfinfo.frames);
+
+    std::cout << "Creating Echo\n";
     // 6. Process samples
     for (sf_count_t n = 0; n < sfinfo.frames; n++) {
         double sample = input[n];
         reservoir.step(sample);
-        double left = readoutL.process();
-        double right = readoutR.process();
-        output[2 * n] = left;
-        output[2 * n + 1] = right;
+		// Collect reservoir state
+		for (size_t i = 0; i < reservoir.size(); i++) {
+			Echo(n, i) = reservoir.getState()[i];
+		}
+		Target(n) = sample; // Target is the input sample itself
+		// Write stereo output
     }
 
+	std::cout << "Training Readout\n";
+    // Ridge regression
+    double lambda = 1e-6;
+    Eigen::MatrixXd XtX = Echo.transpose() * Echo;
+    Eigen::VectorXd Xty = Echo.transpose() * Target;
+    Eigen::VectorXd w = (XtX + lambda * Eigen::MatrixXd::Identity(N, N)).ldlt().solve(Xty);
+
+	std::cout << "Processing Readout\n";
+	// Create readout
+	Readout readout(std::vector<double>(w.data(), w.data() + w.size()));
+	output = readout.processEcho(Echo);
+
+	std::cout << "Writing Output\n";
     // 7. Write stereo WAV
     SF_INFO outinfo = sfinfo;
-    outinfo.channels = 2;
+    outinfo.channels = 1;
     SNDFILE* outfile = sf_open("output.wav", SFM_WRITE, &outinfo);
     if (!outfile) {
         std::cerr << "Error opening output.wav\n";
