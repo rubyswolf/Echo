@@ -1,0 +1,6 @@
+﻿  Matrix.cpp
+C:\Users\spa0028\source\repos\Echo\Matrix\Matrix.cpp(36,18): warning C4244: 'initializing': conversion from 'Eigen::Index' to 'int32_t', possible loss of data
+C:\Users\spa0028\source\repos\Echo\Matrix\Matrix.cpp(37,18): warning C4244: 'initializing': conversion from 'Eigen::Index' to 'int32_t', possible loss of data
+  Matrix.vcxproj -> C:\Users\spa0028\source\repos\Echo\x64\Debug\Matrix.exe
+  'pwsh.exe' is not recognized as an internal or external command,
+  operable program or batch file.
