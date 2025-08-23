@@ -5,7 +5,8 @@
 
 int main() {
     int size = 200;                 // reservoir size
-    double targetRadius = 0.95;     // desired spectral radius
+    double targetRadius = 1.1;     // desired spectral radius
+    double sparsity = 0.1;          // fraction of non-zero weights
 
     Eigen::MatrixXd W = Eigen::MatrixXd::Zero(size, size);
 
@@ -15,7 +16,8 @@ int main() {
     // Fill sparse random weights
     for (int i = 0; i < size; i++)
         for (int j = 0; j < size; j++)
-            W(i, j) = dist(rng);
+            if (dist(rng) < sparsity)
+                W(i, j) = dist(rng);
 
     // Compute spectral radius
     Eigen::EigenSolver<Eigen::MatrixXd> solver(W);

@@ -33,6 +33,10 @@ public:
         : W(W), state(W.size(), 0.0) {
     }
 
+    void reset() {
+        std::fill(state.begin(), state.end(), 0.0);
+    }
+
     void step(double input) {
         // Simple recurrent update: state = ReLU(W*state + input)
         std::vector<double> new_state(state.size(), 0.0);
@@ -57,7 +61,7 @@ public:
 private:
     std::vector<std::vector<double>> W;
     std::vector<double> state;
-	double alpha = 1.0; // Leaky integrator coefficient
+	double alpha = 0.1; // Leaky integrator coefficient
  };
 
 // ========== Readout ==========
@@ -117,79 +121,89 @@ private:
     std::vector<double> weights;  // trained or random init
 };
 
+// ===== WAV loader helper =====
+std::vector<double> loadMonoWav(const std::string& filename, SF_INFO& sfinfo) {
+    SNDFILE* infile = sf_open(filename.c_str(), SFM_READ, &sfinfo);
+    if (!infile) throw std::runtime_error("Error opening " + filename);
+    if (sfinfo.channels != 1) throw std::runtime_error("Input must be mono");
+    std::vector<double> data(sfinfo.frames);
+    sf_readf_double(infile, data.data(), sfinfo.frames);
+    sf_close(infile);
+    return data;
+}
+
+// ===== WAV writer helper =====
+void writeMonoWav(const std::string& filename, const std::vector<double>& data, SF_INFO sfinfo) {
+    SF_INFO outinfo = sfinfo;
+    outinfo.channels = 1;
+    SNDFILE* outfile = sf_open(filename.c_str(), SFM_WRITE, &outinfo);
+    if (!outfile) throw std::runtime_error("Error opening " + filename);
+    sf_writef_double(outfile, data.data(), sfinfo.frames);
+    sf_close(outfile);
+}
 
 // ========== Main ==========
 int main() {
-    std::cout << "Loading Data\n";
+    try {
+        std::cout << "Loading reservoir\n";
+        auto W = loadMatrix("reservoir0.95.bin");
+        Reservoir reservoir(W);
 
-    // 1. Load reservoir weight matrix
-    auto W = loadMatrix("reservoir.bin");
+        // ===== Train on input1/output1 =====
+        std::cout << "Loading training input/output\n";
+        SF_INFO sfinfo1;
+        auto input1 = loadMonoWav("input1.wav", sfinfo1);
+        auto output1 = loadMonoWav("output1.wav", sfinfo1); // target
 
-    // 2. Initialize reservoir
-    Reservoir reservoir(W);
+        int T1 = sfinfo1.frames;
+        int N = reservoir.size();
+        Eigen::MatrixXd Echo1(T1, N);
+        Eigen::VectorXd Target1(T1);
 
-    // 4. Load mono WAV
-    SF_INFO sfinfo;
-    SNDFILE* infile = sf_open("rickroll.wav", SFM_READ, &sfinfo);
-    if (!infile) {
-        std::cerr << "Error opening input.wav\n";
+        std::cout << "Collecting reservoir states\n";
+        reservoir.reset();
+        for (int t = 0; t < T1; t++) {
+            reservoir.step(input1[t]);
+            for (size_t j = 0; j < N; j++)
+                Echo1(t, j) = reservoir.getState()[j];
+            Target1(t) = output1[t];
+        }
+
+        std::cout << "Training readout\n";
+        double lambda = 1e-6;
+        Eigen::MatrixXd XtX = Echo1.transpose() * Echo1;
+        Eigen::VectorXd Xty = Echo1.transpose() * Target1;
+        Eigen::VectorXd w = (XtX + lambda * Eigen::MatrixXd::Identity(N, N)).ldlt().solve(Xty);
+
+        Readout readout(std::vector<double>(w.data(), w.data() + w.size()));
+
+        // ===== Apply to input2 =====
+        std::cout << "Loading new input\n";
+        SF_INFO sfinfo2;
+        auto input2 = loadMonoWav("input1.wav", sfinfo2);
+        std::vector<double> output2(input2.size());
+
+        std::cout << "Processing new input\n";
+        reservoir.reset();
+        for (size_t t = 0; t < input2.size(); t++) {
+            reservoir.step(input2[t]);
+            // Live readout
+            double y = 0.0;
+            const auto& st = reservoir.getState();
+            for (size_t j = 0; j < N; j++)
+                y += w[j] * st[j];
+            output2[t] = y;
+        }
+
+        std::cout << "Writing echo_output2.wav\n";
+        writeMonoWav("echo_output2.wav", output2, sfinfo2);
+
+        std::cout << "Done!\n";
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
         return 1;
     }
-    if (sfinfo.channels != 1) {
-        std::cerr << "Input must be mono\n";
-        return 1;
-    }
-    std::vector<double> input(sfinfo.frames);
-    sf_readf_double(infile, input.data(), sfinfo.frames);
-    sf_close(infile);
 
-	int T = sfinfo.frames; // Number of time steps
-	int N = reservoir.size(); // Number of reservoir neurons
-    // X: matrix of states (T x N)
-    // y: target vector (T x 1)
-    Eigen::MatrixXd Echo(T, N);
-    Eigen::VectorXd Target(T);
-
-    // 5. Prepare stereo output
-    std::vector<double> output(sfinfo.frames);
-
-    std::cout << "Creating Echo\n";
-    // 6. Process samples
-    for (sf_count_t n = 0; n < sfinfo.frames; n++) {
-        double sample = input[n];
-        reservoir.step(sample);
-		// Collect reservoir state
-		for (size_t i = 0; i < reservoir.size(); i++) {
-			Echo(n, i) = reservoir.getState()[i];
-		}
-		Target(n) = sample; // Target is the input sample itself
-		// Write stereo output
-    }
-
-	std::cout << "Training Readout\n";
-    // Ridge regression
-    double lambda = 1e-6;
-    Eigen::MatrixXd XtX = Echo.transpose() * Echo;
-    Eigen::VectorXd Xty = Echo.transpose() * Target;
-    Eigen::VectorXd w = (XtX + lambda * Eigen::MatrixXd::Identity(N, N)).ldlt().solve(Xty);
-
-	std::cout << "Processing Readout\n";
-	// Create readout
-	Readout readout(std::vector<double>(w.data(), w.data() + w.size()));
-	output = readout.processEcho(Echo);
-
-	std::cout << "Writing Output\n";
-    // 7. Write stereo WAV
-    SF_INFO outinfo = sfinfo;
-    outinfo.channels = 1;
-    SNDFILE* outfile = sf_open("output.wav", SFM_WRITE, &outinfo);
-    if (!outfile) {
-        std::cerr << "Error opening output.wav\n";
-        return 1;
-    }
-    sf_writef_double(outfile, output.data(), sfinfo.frames);
-    sf_close(outfile);
-
-    std::cout << "Processing complete -> output.wav\n";
     return 0;
 }

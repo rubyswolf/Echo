@@ -2,8 +2,8 @@ import soundfile as sf
 import numpy as np
 
 # Load audio files
-orig, sr1 = sf.read("rickroll.wav")
-out, sr2 = sf.read("output.wav")
+orig, sr1 = sf.read("output1.wav")
+out, sr2 = sf.read("echo_output2.wav")
 
 # Ensure sample rates match
 if sr1 != sr2:
