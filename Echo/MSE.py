@@ -2,7 +2,7 @@ import soundfile as sf
 import numpy as np
 
 # Load audio files
-orig, sr1 = sf.read("output1.wav")
+orig, sr1 = sf.read("output2.wav")
 out, sr2 = sf.read("echo_output2.wav")
 
 # Ensure sample rates match
