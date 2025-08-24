@@ -54,7 +54,7 @@ public:
 private:
     std::vector<std::vector<double>> W;
     std::vector<double> state;
-    double alpha = 0.8; // leaky coefficient
+    double alpha = 0.6; // leaky coefficient
 };
 
 // ========= Helpers for WAV =========
@@ -86,86 +86,106 @@ void writeMonoWav(const std::string& filename, const std::vector<double>& data, 
 // Training alternates: (a) closed-form ridge for w given d; (b) gradient step on d given w.
 class DelayedReadout {
 public:
-    DelayedReadout(size_t features, int Dmax, double lambda = 1e-6, double gamma = 0.0, double lr = 1e-3, int ls = 1)
-        : N(features), Dmax(Dmax), lambda(lambda), gamma(gamma), lr(lr), ls(ls) {
+    DelayedReadout(size_t features, int Dmax, double lambda = 1e-6, double gamma = 0.0, double lr = 1e-3, int ls = 1, double max_step = 50)
+        : N(features), Dmax(Dmax), lambda(lambda), gamma(gamma), lr(lr), ls(ls), max_step(max_step) {
         w.assign(N, 0.0);
         d.assign(N, 0.0);  // init at zero delay
     }
 
     // Train using Echo (T x N) and target (T)
     void train(const Eigen::MatrixXd& Echo, const Eigen::VectorXd& Target,
-        int iters = 200, bool verbose = true) {
+        int iters = 200) {
         const int T = (int)Echo.rows();
         Eigen::MatrixXd Xs(T, (int)N); // shifted design
         Eigen::MatrixXd Delta(T, (int)N); // x(t-k-1) - x(t-k) per (t,j)
 
+        // --- Adam state for delays ---
+        std::vector<double> m(N, 0.0), v(N, 0.0);
+        int adam_t = 0;
+        const double beta1 = 0.9, beta2 = 0.999, eps = 1e-8;
+
         bool stopRequested = false;
+
+        // --- INITIAL RIDGE SOLVE so w != 0 and grads are meaningful ---
+        buildShifted(Echo, d, Xs, nullptr);
+        {
+            Eigen::MatrixXd XtX = Xs.transpose() * Xs;
+            Eigen::VectorXd Xty = Xs.transpose() * Target;
+            Eigen::MatrixXd I = Eigen::MatrixXd::Identity((int)N, (int)N);
+            Eigen::VectorXd w_vec = (XtX + lambda * I).ldlt().solve(Xty);
+            for (size_t j = 0; j < N; ++j) w[j] = w_vec[(int)j];
+        }
+
         for (int it = 0; it < iters; ++it) {
 
-            // ---- (1) Multiple gradient descent steps for delays before ridge ----
+            // ---- (1) Multiple adaptive GD steps for delays before ridge ----
             for (int step = 0; step < ls; ++step) {
                 // Build shifted Echo and Delta
                 buildShifted(Echo, d, Xs, &Delta);
 
-                // Residuals using current weights
+                // current prediction with current w
                 Eigen::VectorXd w_vec((int)N);
                 for (size_t j = 0; j < N; ++j) w_vec[(int)j] = w[j];
                 Eigen::VectorXd yhat = Xs * w_vec;
-                // 1) Basic mse & max-abs
-                double mse_cpp = (yhat - Target).squaredNorm() / (double)T;
-                double maxabs = (yhat - Target).cwiseAbs().maxCoeff();
-
-                // 2) normalized MSE (relative to target variance)
-                double targ_mean = Target.mean();
-                double var = (Target.array() - targ_mean).square().sum() / std::max(1, T - 1);
-                double nmse = var > 0 ? mse_cpp / var : mse_cpp;
-
-                // 3) cross-correlation lag search (small window)
-                int maxLagCheck = std::min((int)Dmax * 2, T / 2); // search range
-                int bestLag = 0; double bestScore = -1e308;
-                for (int lag = -maxLagCheck; lag <= maxLagCheck; ++lag) {
-                    int tstart = std::max(0, -lag);
-                    int tend = std::min(T, T - lag);
-                    double acc = 0.0;
-                    for (int t = tstart; t < tend; ++t) acc += yhat[t] * Target[t + lag];
-                    if (acc > bestScore) { bestScore = acc; bestLag = lag; }
-                }
-
-                // 4) weighted mean delay (abs weights) & top-k
-                double wnum = 0, wden = 0;
-                for (size_t j = 0;j < N;++j) { wnum += std::abs(w[j]) * d[j]; wden += std::abs(w[j]); }
-                double wmean = (wden > 0) ? (wnum / wden) : 0.0;
-                std::vector<std::pair<double, int>> ord;
-                ord.reserve(N);
-                for (size_t j = 0;j < N;++j) ord.emplace_back(std::abs(w[j]), (int)j);
-                std::sort(ord.begin(), ord.end(), std::greater<>());
-                int K = std::min(10, (int)ord.size());
-                std::cout << "Iter " << it << ": mse=" << mse_cpp << " nmse=" << nmse
-                    << " maxabs=" << maxabs << " bestLag=" << bestLag
-                    << " mean_d=" << meanDelay() << " wmean_d=" << wmean << "\n";
-                std::cout << " Top " << K << ": ";
-                for (int i = 0;i < K;++i) {
-                    int j = ord[i].second;
-                    std::cout << "(" << ord[i].first << "," << d[j] << ") ";
-                }
-                std::cout << "\n";
                 Eigen::VectorXd e = yhat - Target;
 
-                // Gradient for delays
-                std::vector<double> grad_d(N, 0.0);
-                for (size_t j = 0; j < N; ++j) {
-                    double acc = 0.0;
-                    for (int t = 0; t < T; ++t) acc += e[t] * Delta(t, (int)j);
-                    grad_d[j] = 2.0 * w[j] * acc + gamma * d[j];
+                // Precompute column norms of Delta to normalize gradients
+                std::vector<double> delta_norm(N);
+                for (int j = 0; j < (int)N; ++j) {
+                    delta_norm[j] = Delta.col(j).norm();
+                    if (delta_norm[j] < 1e-12) delta_norm[j] = 1e-12; // avoid div0
                 }
 
-                // Update and clamp delays
+                // Compute raw gradients (accumulate) and basic stats
+                std::vector<double> grad_d(N, 0.0);
+                double max_abs_grad = 0.0;
                 for (size_t j = 0; j < N; ++j) {
-                    d[j] -= lr * grad_d[j];
-                    if (d[j] < 0.0) d[j] = 0.0;
-                    if (d[j] > (double)Dmax) d[j] = (double)Dmax;
+                    double acc = 0.0;
+                    // accumulate e[t] * Delta(t,j)
+                    for (int t = 0; t < T; ++t) acc += e[t] * Delta(t, (int)j);
+                    // normalize by Delta norm to stabilize per-feature scale
+                    double g = 2.0 * w[j] * (acc / delta_norm[j]) + gamma * d[j];
+                    grad_d[j] = g;
+                    max_abs_grad = std::max(max_abs_grad, std::abs(g));
                 }
-            }
+
+                // Adam update per-delay with safety cap
+                adam_t++;
+                int clamped_count = 0;
+                for (size_t j = 0; j < N; ++j) {
+                    double g = grad_d[j];
+                    m[j] = beta1 * m[j] + (1.0 - beta1) * g;
+                    v[j] = beta2 * v[j] + (1.0 - beta2) * g * g;
+                    double m_hat = m[j] / (1.0 - std::pow(beta1, adam_t));
+                    double v_hat = v[j] / (1.0 - std::pow(beta2, adam_t));
+                    // adaptive step
+                    double raw_step = lr * m_hat / (std::sqrt(v_hat) + eps);
+
+                    // apply soft-tanh scaling then hard cap
+                    double soft = max_step * std::tanh(raw_step / max_step);
+                    double step_val = soft;
+                    // Hard clamp for extra safety
+                    if (step_val > max_step) step_val = max_step;
+                    if (step_val < -max_step) step_val = -max_step;
+
+                    d[j] -= step_val;
+
+                    // clamp d to bounds
+                    if (d[j] < 0.0) { d[j] = 0.0; clamped_count++; }
+                    if (d[j] > (double)Dmax) { d[j] = (double)Dmax; clamped_count++; }
+                }
+
+                // diagnostic print for each inner step (optional but useful)
+                // weighted mean delay (abs w)
+                double wnum = 0.0, wden = 0.0;
+                for (size_t j = 0; j < N; ++j) { wnum += std::abs(w[j]) * d[j]; wden += std::abs(w[j]); }
+                double wmean = (wden > 0.0) ? (wnum / wden) : 0.0;
+                std::cout << "Delay Iter " << it << ": step=" << step
+                    << " maxGrad=" << max_abs_grad
+                    << " clamped=" << clamped_count
+                    << " mean d=" << meanDelay()
+                    << " wmean_d=" << wmean << "\n";
+            } // end inner ls steps
 
             // ---- (2) Closed-form ridge for weights ----
             buildShifted(Echo, d, Xs, nullptr); // rebuild after final delay step
@@ -175,14 +195,12 @@ public:
             Eigen::VectorXd w_vec = (XtX + lambda * I).ldlt().solve(Xty);
             for (size_t j = 0; j < N; ++j) w[j] = w_vec[(int)j];
 
-            // ---- (3) Verbose output ----
-            if (verbose) {
-                Eigen::VectorXd yhat = Xs * w_vec;
-                Eigen::VectorXd e = yhat - Target;
-                double mse = e.squaredNorm() / (double)T;
-                std::cout << "Iter " << it << ": MSE=" << mse
-                    << ", mean d=" << meanDelay() << "\n";
-            }
+            // ---- (3) Verbose output (outer iteration) ----
+            Eigen::VectorXd yhat_outer = Xs * w_vec;
+            Eigen::VectorXd e_outer = yhat_outer - Target;
+            double mse = e_outer.squaredNorm() / (double)T;
+            std::cout << "# Ridge Iter " << it << ": MSE=" << mse
+                << ", mean d=" << meanDelay() << "\n";
 
             // ---- (4) Stop request (ESC key) ----
             if (_kbhit()) {
@@ -193,13 +211,14 @@ public:
                     break;
                 }
             }
-        }
+        } // end outer iters
 
         std::cout << "Training finished (iters=" << (stopRequested ? "early" : "all") << ")\n";
 
         // Cache k and a for fast inference
         computeKA();
     }
+
 
 
     // Offline apply to a pre-collected Echo (same Echo used to build live reservoir states)
@@ -245,7 +264,7 @@ public:
 private:
     size_t N;
     int Dmax, ls;
-    double lambda, gamma, lr;
+    double lambda, gamma, lr, max_step;
     std::vector<double> w;   // readout weights
     std::vector<double> d;   // per-feature delay (samples)
 
@@ -325,15 +344,16 @@ int main() {
 
         // ---- Train delayed readout ----
         std::cout << "Training delayed readout (method 2)\n";
-        int Dmax = 64;          // max delay in samples (tune)
+        int Dmax = 80;          // max delay in samples (tune)
         double lambda = 1e-6;   // ridge for weights
-        double gamma = 1e-6;    // small L2 on delays; set 0 to disable
-        double lr = 0.1;       // delay learning rate
-        int ls = 10;        // delay learning steps
+        double gamma = 1e-8;    // small L2 on delays; set 0 to disable
+        double lr = 0.01;       // delay learning rate
+        int ls = 8;        // delay learning steps
+        double max_step = 2; // max samples change per GD step (tune 0.1..5.0)
         int iters = 200;        // outer iterations
 
-        DelayedReadout readout((size_t)N, Dmax, lambda, gamma, lr, ls);
-        readout.train(Echo1, Target1, iters, /*verbose=*/true);
+        DelayedReadout readout((size_t)N, Dmax, lambda, gamma, lr, ls, max_step);
+        readout.train(Echo1, Target1, iters);
 
         // ---- Offline: apply to training echo (to inspect fit) ----
         std::cout << "Processing training input (offline)\n";
