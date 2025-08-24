@@ -54,7 +54,7 @@ public:
 private:
     std::vector<std::vector<double>> W;
     std::vector<double> state;
-    double alpha = 0.6; // leaky coefficient
+    double alpha = 0.1; // leaky coefficient
 };
 
 // ========= Helpers for WAV =========
@@ -128,6 +128,7 @@ public:
                 for (size_t j = 0; j < N; ++j) w_vec[(int)j] = w[j];
                 Eigen::VectorXd yhat = Xs * w_vec;
                 Eigen::VectorXd e = yhat - Target;
+                double mse_inner = e.squaredNorm() / (double)T;
 
                 // Precompute column norms of Delta to normalize gradients
                 std::vector<double> delta_norm(N);
@@ -180,7 +181,8 @@ public:
                 double wnum = 0.0, wden = 0.0;
                 for (size_t j = 0; j < N; ++j) { wnum += std::abs(w[j]) * d[j]; wden += std::abs(w[j]); }
                 double wmean = (wden > 0.0) ? (wnum / wden) : 0.0;
-                std::cout << "Delay Iter " << it << ": step=" << step
+
+                std::cout << "Delay Iter " << it << ": step=" << step << " MSE=" << mse_inner
                     << " maxGrad=" << max_abs_grad
                     << " clamped=" << clamped_count
                     << " mean d=" << meanDelay()
@@ -344,13 +346,13 @@ int main() {
 
         // ---- Train delayed readout ----
         std::cout << "Training delayed readout (method 2)\n";
-        int Dmax = 80;          // max delay in samples (tune)
+        int Dmax = 250;          // max delay in samples (tune)
         double lambda = 1e-6;   // ridge for weights
         double gamma = 1e-8;    // small L2 on delays; set 0 to disable
-        double lr = 0.01;       // delay learning rate
-        int ls = 8;        // delay learning steps
+        double lr = 0.05;       // delay learning rate
+        int ls = 10;        // delay learning steps
         double max_step = 2; // max samples change per GD step (tune 0.1..5.0)
-        int iters = 200;        // outer iterations
+        int iters = 10;        // outer iterations
 
         DelayedReadout readout((size_t)N, Dmax, lambda, gamma, lr, ls, max_step);
         readout.train(Echo1, Target1, iters);
